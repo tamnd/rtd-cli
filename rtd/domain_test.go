@@ -21,13 +21,16 @@ func TestDomainInfo(t *testing.T) {
 	if info.Identity.Binary != "rtd" {
 		t.Errorf("Identity.Binary = %q, want rtd", info.Identity.Binary)
 	}
+	if Host != "readthedocs.org" {
+		t.Errorf("Host = %q, want readthedocs.org", Host)
+	}
 }
 
 func TestClassify(t *testing.T) {
 	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
+		{"projects/django", "page", "projects/django"},
 		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+		{"https://" + Host + "/projects/django/", "page", "projects/django"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
@@ -39,8 +42,8 @@ func TestClassify(t *testing.T) {
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+	got, err := Domain{}.Locate("page", "projects/django")
+	want := "https://" + Host + "/projects/django"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
