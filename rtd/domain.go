@@ -2,7 +2,9 @@ package rtd
 
 import (
 	"context"
+	"errors"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -14,14 +16,10 @@ import (
 //
 //	import _ "github.com/tamnd/rtd-cli/rtd"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// rtd:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone rtd binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The init below registers it; the host then dereferences rtd:// URIs by
+// routing to the operations Register installs. The same Domain also builds the
+// standalone rtd binary (see cli.NewApp), so the binary and a host share one
+// source of truth.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the rtd driver. It carries no state; the per-run client is
@@ -37,39 +35,63 @@ func (Domain) Info() kit.DomainInfo {
 		Identity: kit.Identity{
 			Binary: "rtd",
 			Short:  "Browse and search ReadTheDocs documentation projects",
-			Long: `Browse and search ReadTheDocs documentation projects
+			Long: `rtd reads ReadTheDocs data over the public API v3, shapes it into clean records,
+and prints output that pipes into the rest of your tools.
 
-rtd reads public rtd data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Most commands require an API token from https://readthedocs.org/accounts/tokens/.
+Set it via the RTD_TOKEN environment variable.
+
+Quick start:
+  rtd search django                  search docs projects
+  rtd project django                 project details
+  rtd list --limit 20                list your own projects (token required)`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/rtd-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `rtd page` and
-	// `ant get rtd://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "discover",
+		Summary: "Search ReadTheDocs projects and pages",
+		Args:    []kit.Arg{{Name: "query", Help: "search query"}},
+	}, searchDocs)
 
-	// List op: members of a page, the home of `rtd links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// rtd://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:     "project",
+		Group:    "read",
+		Single:   true,
+		Resolver: true,
+		URIType:  "project",
+		Summary:  "Show details of a ReadTheDocs project",
+		Args:     []kit.Arg{{Name: "slug", Help: "project slug"}},
+	}, getProject)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "list",
+		Group:   "read",
+		Summary: "List your ReadTheDocs projects (token required)",
+		Args:    []kit.Arg{{Name: "limit", Help: "max results", Optional: true}},
+	}, listProjects)
+
+	// Fallback scaffold op: raw page navigation
+	kit.Handle(app, kit.OpMeta{
+		Name:     "page",
+		Group:    "read",
+		Single:   true,
+		Resolver: true,
+		URIType:  "page",
+		Summary:  "Fetch a raw page by path",
+		Args:     []kit.Arg{{Name: "ref", Help: "page path or URL"}},
+	}, getPage)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -84,28 +106,70 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	if cfg.Timeout > 0 {
 		c.HTTP.Timeout = cfg.Timeout
 	}
+	if tok := os.Getenv("RTD_TOKEN"); tok != "" {
+		c.Token = tok
+	}
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
+
+type searchInput struct {
+	Query  string  `kit:"arg" help:"search query"`
+	Limit  int     `kit:"flag,inherit" help:"max results" default:"25"`
+	Client *Client `kit:"inject"`
+}
+
+type projectInput struct {
+	Slug   string  `kit:"arg" help:"project slug"`
+	Client *Client `kit:"inject"`
+}
+
+type listInput struct {
+	Limit  int     `kit:"flag,inherit" help:"max results" default:"25"`
+	Client *Client `kit:"inject"`
+}
 
 type pageRef struct {
 	Ref    string  `kit:"arg" help:"page path or URL"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+// --- handlers ---
+
+func searchDocs(ctx context.Context, in searchInput, emit func(SearchResult) error) error {
+	results, err := in.Client.Search(ctx, in.Query, in.Limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, r := range results {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// --- handlers ---
+func getProject(ctx context.Context, in projectInput, emit func(*Project) error) error {
+	p, err := in.Client.GetProject(ctx, in.Slug)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(p)
+}
+
+func listProjects(ctx context.Context, in listInput, emit func(Project) error) error {
+	projects, err := in.Client.ListProjects(ctx, in.Limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, p := range projects {
+		if err := emit(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
 	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
@@ -115,23 +179,9 @@ func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
 	return emit(p)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+// --- Resolver ---
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full rtd.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns any accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
 	id = pagePath(input)
 	if id == "" {
@@ -140,18 +190,20 @@ func (Domain) Classify(input string) (uriType, id string, err error) {
 	return "page", id, nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("rtd has no resource type %q", uriType)
+	switch uriType {
+	case "page":
+		return BaseURL + "/" + strings.Trim(id, "/"), nil
+	case "project":
+		return BaseURL + "/projects/" + strings.Trim(id, "/") + "/", nil
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	return "", errs.Usage("rtd has no resource type %q", uriType)
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
+// pagePath turns any accepted input into the canonical page id.
 func pagePath(input string) string {
 	input = strings.TrimSpace(input)
 	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
@@ -160,14 +212,16 @@ func pagePath(input string) string {
 	return strings.Trim(input, "/")
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr translates library errors into kit error kinds.
 func mapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrNotFound) {
+		return errs.NotFound("%s", err.Error())
+	}
+	if errors.Is(err, ErrUnauthorized) {
+		return errs.Usage("%s", err.Error())
+	}
 	return err
 }
