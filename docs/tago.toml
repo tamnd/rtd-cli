@@ -1,0 +1,10 @@
+title       = "rtd"
+baseURL     = "https://rtd-cli.tamnd.com/"
+description = "Browse and search ReadTheDocs documentation projects"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/rtd-cli"
